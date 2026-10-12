@@ -30,8 +30,7 @@ import test_common
 
 
 @triton.jit
-def extract_slice_bf16_extf_kernel(x_ptr, out_ptr, N: tl.constexpr,
-                                   OFF: tl.constexpr, SZ: tl.constexpr):
+def extract_slice_bf16_extf_kernel(x_ptr, out_ptr, N: tl.constexpr, OFF: tl.constexpr, SZ: tl.constexpr):
     offs = tl.arange(0, N)
     x = tl.load(x_ptr + offs)
     x_f32 = al.cast(x, tl.float32)
