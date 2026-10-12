@@ -211,7 +211,7 @@ bool BubbleUpExtract<ExtractOpTy>::isBf16ExtSliceMisaligned(
       linearOffset += *offset * stride;
       stride *= shape[i];
     }
-    // bf16 is 2 bytes/element: 32-byte aligned iff linearOffset % 16 == 0.
+    // bf16 is 2 bytes/element: 32-byte aligned if linearOffset % 16 == 0.
     return linearOffset % 16 != 0;
   }
 }
@@ -549,9 +549,8 @@ void BubbleUpOperationPass::runOnOperation() {
 
   RewritePatternSet patterns(ctx);
   patterns.add<BubbleUpExtract<tensor::ExtractOp>,
-               BubbleUpExtract<tensor::ExtractSliceOp>>(ctx,
-                                                        enableAggressiveMode,
-                                                        compileOn91095);
+               BubbleUpExtract<tensor::ExtractSliceOp>>(
+      ctx, enableAggressiveMode, compileOn91095);
 
   if (failed(applyPatternsAndFoldGreedily(moduleOp, std::move(patterns)))) {
     moduleOp->emitError("failed to apply Patterns");
