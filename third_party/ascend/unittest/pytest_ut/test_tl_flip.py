@@ -33,6 +33,8 @@ import test_common
 # 2^k-sized dim into k trailing 2s, xor-swap along each of them, then reshape
 # back. TritonToLinalg recognizes that idiom and rewrites it into the native
 # `ascend.flip`, which lowers through @triton_flip -> hfusion.flip -> hivm.vflip.
+# Since hivm.vflip only flips the last (innermost) dim, only last-dim flips are
+# rewritten; leading-dim flips stay on the bit-reversal path.
 
 
 @triton.jit
@@ -64,6 +66,15 @@ def _assert_flip_lowered(h):
     assert "triton_flip" in code_str
 
 
+def _assert_flip_not_lowered(h):
+    # Leading-dim flips must NOT be rewritten to native flip: hivm.vflip only
+    # supports the last dim, so a rewrite here would fail to compile. Lock in
+    # that these stay on the bit-reversal path (which is still numerically
+    # correct).
+    code_str = h.asm["ttadapter"]
+    assert "triton_flip" not in code_str
+
+
 @pytest.mark.parametrize("size", [64, 8, 4])  # flip dim 2^6, 2^3, 2^2
 @pytest.mark.parametrize("dtype", ['int8', 'int16', 'int32', 'int64', 'float16', 'float32', 'bfloat16', 'uint8'])
 def test_flip_1d(dtype, size):
@@ -75,21 +86,32 @@ def test_flip_1d(dtype, size):
     _assert_flip_lowered(h)
 
 
-@pytest.mark.parametrize("dtype", ['int8', 'int16', 'int32', 'int64', 'float16', 'float32', 'bfloat16', 'uint8'])
-@pytest.mark.parametrize("shape,dim", [
-    ((16, 64), 1),   # flip the trailing 2^6 dim (issue #1638 repro)
-    ((64, 64), 1),   # square matrix, trailing dim
-    ((64, 16), 0),   # flip the leading 2^6 dim
-    ((8, 32), 0),    # leading 2^3 dim -> [2, 2, 2]
-    ((4, 8), 1),     # trailing 2^3 dim -> [2, 2, 2]
-    ((8, 4), 1),     # trailing 2^2 dim -> [2, 2] (smallest split, k=2)
-    ((4, 4), 0),     # leading 2^2 dim -> [2, 2] (smallest split, k=2)
-])
-def test_flip_2d(dtype, shape, dim):
+def _run_flip_2d(shape, dim, dtype):
     rows, cols = shape
     x = test_common.generate_tensor(shape, dtype).npu()
     torch_ref = torch.flip(x, dims=[dim])
     triton_res = torch.empty_like(x)
     h = flip2d_kernel[(1, )](x, triton_res, rows, cols, dim)
     assert (torch_ref == triton_res).all(), (torch_ref, triton_res)
-    _assert_flip_lowered(h)
+    return h
+
+
+@pytest.mark.parametrize("dtype", ['int8', 'int16', 'int32', 'int64', 'float16', 'float32', 'bfloat16', 'uint8'])
+@pytest.mark.parametrize("shape,dim", [
+    ((16, 64), 1),   # flip the trailing 2^6 dim (issue #1638 repro)
+    ((64, 64), 1),   # square matrix, trailing dim
+    ((4, 8), 1),     # trailing 2^3 dim -> [2, 2, 2]
+    ((8, 4), 1),     # trailing 2^2 dim -> [2, 2] (smallest split, k=2)
+])
+def test_flip_2d_trailing(dtype, shape, dim):
+    _assert_flip_lowered(_run_flip_2d(shape, dim, dtype))
+
+
+@pytest.mark.parametrize("dtype", ['int8', 'int16', 'int32', 'int64', 'float16', 'float32', 'bfloat16', 'uint8'])
+@pytest.mark.parametrize("shape,dim", [
+    ((64, 16), 0),   # leading 2^6 dim -> vflip is last-dim only
+    ((8, 32), 0),    # leading 2^3 dim -> [2, 2, 2]
+    ((4, 4), 0),     # leading 2^2 dim -> [2, 2] (smallest split, k=2)
+])
+def test_flip_2d_leading(dtype, shape, dim):
+    _assert_flip_not_lowered(_run_flip_2d(shape, dim, dtype))

@@ -1412,7 +1412,9 @@ static triton::ReduceOp findReduceXorUser(Value value, int64_t axis) {
 // reduce-xor/expand_dims/broadcast/xori chain, then a collapse reshape. That
 // first reshape becomes an unalignable memref.expand_shape (see #1638), so we
 // recognize the idiom and rewrite it into the backend's existing (orphaned)
-// native ascend.flip, which lowers via @triton_flip -> hfusion.flip -> hivm.vflip.
+// native ascend.flip, which lowers via @triton_flip -> hfusion.flip ->
+// hivm.vflip. vflip only flips the last (innermost) dim, so this pattern only
+// fires for last-dim flips; any other dim keeps the bit-reversal idiom.
 struct BitReversalFlipToAscendFlipPattern
     : public OpRewritePattern<triton::ReshapeOp> {
   using OpRewritePattern<triton::ReshapeOp>::OpRewritePattern;
@@ -1423,6 +1425,10 @@ struct BitReversalFlipToAscendFlipPattern
     auto resTy = cast<RankedTensorType>(op.getResult().getType());
     int64_t numTwos = 0, flipDim = -1;
     if (failed(matchExpandToTwos(srcTy, resTy, numTwos, flipDim)))
+      return failure();
+    // hivm.vflip only flips the innermost dim; keep the bit-reversal idiom for
+    // any other dim so non-last-dim tl.flip still compiles.
+    if (flipDim != srcTy.getRank() - 1)
       return failure();
 
     Value cur = op.getResult();
