@@ -29,12 +29,10 @@ import test_common
 # ---------------
 # test tl.flip op
 # ---------------
-# `tl.flip` is lowered in the frontend as a bit-reversal idiom (reshape the
+# `tl.flip` is lowered in the frontend as a bit-reversal idiom: reshape the
 # 2^k-sized dim into k trailing 2s, xor-swap along each of them, then reshape
-# back). The TritonToLinalg pass recognizes that idiom and rewrites it into the
-# native `ascend.flip`. This test covers the flip itself: the flipped dim must
-# be a power of two, and the result must exactly match torch.flip for any dtype
-# (the xor-swap is a pure permutation, so even floats are bit-exact).
+# back. TritonToLinalg recognizes that idiom and rewrites it into the native
+# `ascend.flip`, which lowers through @triton_flip -> hfusion.flip -> hivm.vflip.
 
 
 @triton.jit
@@ -54,14 +52,29 @@ def flip2d_kernel(x_ptr, out_ptr, ROWS: tl.constexpr, COLS: tl.constexpr, dim: t
     tl.store(out_ptr + r * COLS + c, y)
 
 
+def _assert_flip_lowered(h):
+    # Numeric equality alone doesn't prove the rewrite fired: if the
+    # bit-reversal pattern ever silently misses (e.g. upstream changes
+    # tl.flip's lowering, or a canonicalizer folds the reduce/expand/broadcast/
+    # xori chain), the backend falls back to the bit-reversal + expand_shape
+    # path, which still produces a numerically correct result but reintroduces
+    # the #1638 AlignBuffer overflow. Assert the lowered IR actually carries
+    # the native flip (@triton_flip) and no longer holds the unalignable
+    # bit-reversal memref.expand_shape.
+    code_str = h.asm["ttadapter"]
+    assert "triton_flip" in code_str
+    assert "expand_shape" not in code_str
+
+
+@pytest.mark.parametrize("size", [64, 8, 4])  # flip dim 2^6, 2^3, 2^2
 @pytest.mark.parametrize("dtype", ['int8', 'int16', 'int32', 'int64', 'float16', 'float32', 'bfloat16', 'uint8'])
-def test_flip_1d(dtype):
-    size = 64
+def test_flip_1d(dtype, size):
     x = test_common.generate_tensor((size, ), dtype).npu()
     torch_ref = torch.flip(x, dims=[0])
     triton_res = torch.empty_like(x)
-    flip1d_kernel[(1, )](x, triton_res, size, 0)
+    h = flip1d_kernel[(1, )](x, triton_res, size, 0)
     assert (torch_ref == triton_res).all(), (torch_ref, triton_res)
+    _assert_flip_lowered(h)
 
 
 @pytest.mark.parametrize("dtype", ['int8', 'int16', 'int32', 'int64', 'float16', 'float32', 'bfloat16', 'uint8'])
@@ -69,13 +82,16 @@ def test_flip_1d(dtype):
     ((16, 64), 1),   # flip the trailing 2^6 dim (issue #1638 repro)
     ((64, 64), 1),   # square matrix, trailing dim
     ((64, 16), 0),   # flip the leading 2^6 dim
-    ((8, 32), 0),    # smaller 2^3 split on the leading dim
-    ((4, 8), 1),     # smallest split this pattern rewrites (2^2 -> [2, 2])
+    ((8, 32), 0),    # leading 2^3 dim -> [2, 2, 2]
+    ((4, 8), 1),     # trailing 2^3 dim -> [2, 2, 2]
+    ((8, 4), 1),     # trailing 2^2 dim -> [2, 2] (smallest split, k=2)
+    ((4, 4), 0),     # leading 2^2 dim -> [2, 2] (smallest split, k=2)
 ])
 def test_flip_2d(dtype, shape, dim):
     rows, cols = shape
     x = test_common.generate_tensor(shape, dtype).npu()
     torch_ref = torch.flip(x, dims=[dim])
     triton_res = torch.empty_like(x)
-    flip2d_kernel[(1, )](x, triton_res, rows, cols, dim)
+    h = flip2d_kernel[(1, )](x, triton_res, rows, cols, dim)
     assert (torch_ref == triton_res).all(), (torch_ref, triton_res)
+    _assert_flip_lowered(h)
