@@ -48,6 +48,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/TypeRange.h"
@@ -1369,20 +1370,26 @@ public:
 static LogicalResult matchExpandToTwos(RankedTensorType srcTy,
                                        RankedTensorType resTy, int64_t &k,
                                        int64_t &flipDim) {
-  ArrayRef<int64_t> S = srcTy.getShape(), T = resTy.getShape();
-  int64_t R = static_cast<int64_t>(S.size());
-  int64_t R2 = static_cast<int64_t>(T.size());
-  if (R2 <= R) return failure(); // Only match the expanding direction.
-  k = R2 - R + 1;                // Number of 2s the dim was split into.
-  if (k < 2) return failure();
-  for (int64_t d = 0; d < R; ++d) {
-    if ((1LL << k) != S[d]) continue;
-    bool ok = true;
-    for (int64_t i = 0; i < d && ok; ++i) ok = (S[i] == T[i]);
-    for (int64_t i = 0; i < k && ok; ++i) ok = (T[d + i] == 2);
-    for (int64_t i = d + 1; i < R && ok; ++i) ok = (S[i] == T[i + k - 1]);
-    if (ok) {
+  if (resTy.getRank() <= srcTy.getRank()) return failure(); // Expand only.
+  // Reuse MLIR's own reshape decomposition (the same utility bufferization
+  // uses to emit memref.expand_shape). For the expand direction it returns one
+  // list of target dims per source dim; find the single source dim that splits
+  // into >= 2 dims, all of size 2.
+  auto reassoc = getReassociationIndicesForReshape(srcTy, resTy);
+  if (!reassoc) return failure();
+  ArrayRef<int64_t> T = resTy.getShape();
+  for (int64_t d = 0; d < static_cast<int64_t>(reassoc->size()); ++d) {
+    ArrayRef<int64_t> group = (*reassoc)[d];
+    if (group.size() < 2) continue; // This source dim didn't split.
+    bool allTwos = true;
+    for (int64_t idx : group)
+      if (T[idx] != 2) {
+        allTwos = false;
+        break;
+      }
+    if (allTwos) {
       flipDim = d;
+      k = static_cast<int64_t>(group.size());
       return success();
     }
   }
