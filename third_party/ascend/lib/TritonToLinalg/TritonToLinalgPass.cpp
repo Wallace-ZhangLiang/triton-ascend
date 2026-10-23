@@ -1357,24 +1357,10 @@ public:
   }
 };
 
-// `tl.flip` is lowered in the frontend as a bit-reversal idiom: a reshape that
-// splits one dim of size 2^k into k trailing 2s, followed by a
-// reduce-xor/expand_dims/broadcast/xori chain over each new axis, and finally a
-// collapse reshape back to the original shape. That first reshape becomes a
-// `memref.expand_shape [[0],[1,2,3,4,5,6]]` which AlignBuffer cannot align
-// (it reports `cannot align N axis` and overflows UB). The backend already
-// ships a native `ascend.flip` (orphaned: nothing emits it), so instead of
-// fixing AlignBuffer we recognize the idiom here and rewrite the whole chain
-// into `ascend.flip`, which lowers through @triton_flip -> hfusion.flip ->
-// hivm.vflip.
 static LogicalResult matchExpandToTwos(RankedTensorType srcTy,
                                        RankedTensorType resTy, int64_t &k,
                                        int64_t &flipDim) {
   if (resTy.getRank() <= srcTy.getRank()) return failure(); // Expand only.
-  // Reuse MLIR's own reshape decomposition (the same utility bufferization
-  // uses to emit memref.expand_shape). For the expand direction it returns one
-  // list of target dims per source dim; find the single source dim that splits
-  // into >= 2 dims, all of size 2.
   auto reassoc = getReassociationIndicesForReshape(srcTy, resTy);
   if (!reassoc) return failure();
   ArrayRef<int64_t> T = resTy.getShape();
@@ -1389,7 +1375,6 @@ static LogicalResult matchExpandToTwos(RankedTensorType srcTy,
       }
     if (allTwos) {
       flipDim = d;
-      k = static_cast<int64_t>(group.size());
       return success();
     }
   }
@@ -1421,6 +1406,11 @@ static triton::ReduceOp findReduceXorUser(Value v, int64_t axis) {
   return found;
 }
 
+// `tl.flip` lowers to a bit-reversal idiom: reshape 2^k -> [2]^k, then a
+// reduce-xor/expand_dims/broadcast/xori chain, then a collapse reshape. That
+// first reshape becomes an unalignable memref.expand_shape (see #1638), so we
+// recognize the idiom and rewrite it into the backend's existing (orphaned)
+// native ascend.flip, which lowers via @triton_flip -> hfusion.flip -> hivm.vflip.
 struct BitReversalFlipToAscendFlipPattern
     : public OpRewritePattern<triton::ReshapeOp> {
   using OpRewritePattern<triton::ReshapeOp>::OpRewritePattern;
