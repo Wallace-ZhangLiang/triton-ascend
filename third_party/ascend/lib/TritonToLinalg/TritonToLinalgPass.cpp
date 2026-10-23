@@ -48,6 +48,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/TypeRange.h"
@@ -1356,42 +1357,34 @@ public:
   }
 };
 
-// `tl.flip` is lowered in the frontend as a bit-reversal idiom: a reshape that
-// splits one dim of size 2^k into k trailing 2s, followed by a
-// reduce-xor/expand_dims/broadcast/xori chain over each new axis, and finally a
-// collapse reshape back to the original shape. That first reshape becomes a
-// `memref.expand_shape [[0],[1,2,3,4,5,6]]` which AlignBuffer cannot align
-// (it reports `cannot align N axis` and overflows UB). The backend already
-// ships a native `ascend.flip` (orphaned: nothing emits it), so instead of
-// fixing AlignBuffer we recognize the idiom here and rewrite the whole chain
-// into `ascend.flip`, which lowers through @triton_flip -> hfusion.flip ->
-// hivm.vflip.
 static LogicalResult matchExpandToTwos(RankedTensorType srcTy,
-                                       RankedTensorType resTy, int64_t &k,
-                                       int64_t &flipDim) {
-  ArrayRef<int64_t> S = srcTy.getShape(), T = resTy.getShape();
-  int64_t R = static_cast<int64_t>(S.size());
-  int64_t R2 = static_cast<int64_t>(T.size());
-  if (R2 <= R) return failure(); // Only match the expanding direction.
-  k = R2 - R + 1;                // Number of 2s the dim was split into.
-  if (k < 2) return failure();
-  for (int64_t d = 0; d < R; ++d) {
-    if ((1LL << k) != S[d]) continue;
-    bool ok = true;
-    for (int64_t i = 0; i < d && ok; ++i) ok = (S[i] == T[i]);
-    for (int64_t i = 0; i < k && ok; ++i) ok = (T[d + i] == 2);
-    for (int64_t i = d + 1; i < R && ok; ++i) ok = (S[i] == T[i + k - 1]);
-    if (ok) {
+                                       RankedTensorType resTy,
+                                       int64_t &numTwos, int64_t &flipDim) {
+  if (resTy.getRank() <= srcTy.getRank()) return failure(); // Expand only.
+  auto reassoc = getReassociationIndicesForReshape(srcTy, resTy);
+  if (!reassoc) return failure();
+  ArrayRef<int64_t> resShape = resTy.getShape();
+  for (int64_t d = 0; d < static_cast<int64_t>(reassoc->size()); ++d) {
+    ArrayRef<int64_t> group = (*reassoc)[d];
+    if (group.size() < 2) continue; // This source dim didn't split.
+    bool allTwos = true;
+    for (int64_t idx : group)
+      if (resShape[idx] != 2) {
+        allTwos = false;
+        break;
+      }
+    if (allTwos) {
       flipDim = d;
+      numTwos = static_cast<int64_t>(group.size());
       return success();
     }
   }
   return failure();
 }
 
-template <typename OpTy> static OpTy getSingleUser(Value v) {
-  if (!v.hasOneUse()) return OpTy();
-  return dyn_cast<OpTy>(*v.user_begin());
+template <typename OpTy> static OpTy getSingleUser(Value value) {
+  if (!value.hasOneUse()) return OpTy();
+  return dyn_cast<OpTy>(*value.user_begin());
 }
 
 static bool isXorReduce(triton::ReduceOp op) {
@@ -1402,18 +1395,24 @@ static bool isXorReduce(triton::ReduceOp op) {
   return true;
 }
 
-static triton::ReduceOp findReduceXorUser(Value v, int64_t axis) {
+static triton::ReduceOp findReduceXorUser(Value value, int64_t axis) {
   triton::ReduceOp found;
-  for (auto *u : v.getUsers()) {
-    auto r = dyn_cast<triton::ReduceOp>(u);
-    if (r && static_cast<int64_t>(r.getAxis()) == axis && isXorReduce(r)) {
+  for (auto *user : value.getUsers()) {
+    auto reduce = dyn_cast<triton::ReduceOp>(user);
+    if (reduce && static_cast<int64_t>(reduce.getAxis()) == axis &&
+        isXorReduce(reduce)) {
       if (found) return triton::ReduceOp(); // Ambiguous: bail out.
-      found = r;
+      found = reduce;
     }
   }
   return found;
 }
 
+// `tl.flip` lowers to a bit-reversal idiom: reshape 2^k -> [2]^k, then a
+// reduce-xor/expand_dims/broadcast/xori chain, then a collapse reshape. That
+// first reshape becomes an unalignable memref.expand_shape (see #1638), so we
+// recognize the idiom and rewrite it into the backend's existing (orphaned)
+// native ascend.flip, which lowers via @triton_flip -> hfusion.flip -> hivm.vflip.
 struct BitReversalFlipToAscendFlipPattern
     : public OpRewritePattern<triton::ReshapeOp> {
   using OpRewritePattern<triton::ReshapeOp>::OpRewritePattern;
@@ -1422,13 +1421,13 @@ struct BitReversalFlipToAscendFlipPattern
                                 PatternRewriter &rewriter) const override {
     auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
     auto resTy = cast<RankedTensorType>(op.getResult().getType());
-    int64_t k = 0, flipDim = -1;
-    if (failed(matchExpandToTwos(srcTy, resTy, k, flipDim)))
+    int64_t numTwos = 0, flipDim = -1;
+    if (failed(matchExpandToTwos(srcTy, resTy, numTwos, flipDim)))
       return failure();
 
     Value cur = op.getResult();
     SmallVector<Operation *> toErase{op};
-    for (int64_t i = 0; i < k; ++i) {
+    for (int64_t i = 0; i < numTwos; ++i) {
       int64_t axis = flipDim + i;
       auto reduce = findReduceXorUser(cur, axis);
       if (!reduce) return failure();
