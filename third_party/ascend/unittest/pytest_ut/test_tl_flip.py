@@ -97,21 +97,19 @@ def _run_flip_2d(shape, dim, dtype):
 
 
 @pytest.mark.parametrize("dtype", ['int8', 'int16', 'int32', 'int64', 'float16', 'float32', 'bfloat16', 'uint8'])
-@pytest.mark.parametrize("shape,dim", [
-    ((16, 64), 1),   # flip the trailing 2^6 dim (issue #1638 repro)
-    ((64, 64), 1),   # square matrix, trailing dim
-    ((4, 8), 1),     # trailing 2^3 dim -> [2, 2, 2]
-    ((8, 4), 1),     # trailing 2^2 dim -> [2, 2] (smallest split, k=2)
-])
+@pytest.mark.parametrize("shape,dim", [((16, 64), 1),  # flip the trailing 2^6 dim (issue #1638 repro)
+                                       ((64, 64), 1),  # square matrix, trailing dim
+                                       ((4, 8), 1),  # trailing 2^3 dim -> [2, 2, 2]
+                                       ((8, 4), 1),  # trailing 2^2 dim -> [2, 2] (smallest split, k=2)
+                                       ])
 def test_flip_2d_trailing(dtype, shape, dim):
     _assert_flip_lowered(_run_flip_2d(shape, dim, dtype))
 
 
 @pytest.mark.parametrize("dtype", ['int8', 'int16', 'int32', 'int64', 'float16', 'float32', 'bfloat16', 'uint8'])
-@pytest.mark.parametrize("shape,dim", [
-    ((64, 16), 0),   # leading 2^6 dim -> vflip is last-dim only
-    ((8, 32), 0),    # leading 2^3 dim -> [2, 2, 2]
-    ((4, 4), 0),     # leading 2^2 dim -> [2, 2] (smallest split, k=2)
-])
+@pytest.mark.parametrize("shape,dim", [((64, 16), 0),  # leading 2^6 dim -> vflip is last-dim only
+                                       ((8, 32), 0),  # leading 2^3 dim -> [2, 2, 2]
+                                       ((4, 4), 0),  # leading 2^2 dim -> [2, 2] (smallest split, k=2)
+                                       ])
 def test_flip_2d_leading(dtype, shape, dim):
     _assert_flip_not_lowered(_run_flip_2d(shape, dim, dtype))

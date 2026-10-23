@@ -1358,15 +1358,18 @@ public:
 };
 
 static LogicalResult matchExpandToTwos(RankedTensorType srcTy,
-                                       RankedTensorType resTy,
-                                       int64_t &numTwos, int64_t &flipDim) {
-  if (resTy.getRank() <= srcTy.getRank()) return failure(); // Expand only.
+                                       RankedTensorType resTy, int64_t &numTwos,
+                                       int64_t &flipDim) {
+  if (resTy.getRank() <= srcTy.getRank())
+    return failure(); // Expand only.
   auto reassoc = getReassociationIndicesForReshape(srcTy, resTy);
-  if (!reassoc) return failure();
+  if (!reassoc)
+    return failure();
   ArrayRef<int64_t> resShape = resTy.getShape();
   for (int64_t d = 0; d < static_cast<int64_t>(reassoc->size()); ++d) {
     ArrayRef<int64_t> group = (*reassoc)[d];
-    if (group.size() < 2) continue; // This source dim didn't split.
+    if (group.size() < 2)
+      continue; // This source dim didn't split.
     bool allTwos = true;
     for (int64_t idx : group)
       if (resShape[idx] != 2) {
@@ -1383,7 +1386,8 @@ static LogicalResult matchExpandToTwos(RankedTensorType srcTy,
 }
 
 template <typename OpTy> static OpTy getSingleUser(Value value) {
-  if (!value.hasOneUse()) return OpTy();
+  if (!value.hasOneUse())
+    return OpTy();
   return dyn_cast<OpTy>(*value.user_begin());
 }
 
@@ -1391,7 +1395,8 @@ static bool isXorReduce(triton::ReduceOp op) {
   if (!op->getNumRegions() || op->getRegion(0).getBlocks().size() != 1)
     return false;
   for (Operation &inner : op->getRegion(0).front().without_terminator())
-    if (!isa<arith::XOrIOp>(inner)) return false;
+    if (!isa<arith::XOrIOp>(inner))
+      return false;
   return true;
 }
 
@@ -1401,7 +1406,8 @@ static triton::ReduceOp findReduceXorUser(Value value, int64_t axis) {
     auto reduce = dyn_cast<triton::ReduceOp>(user);
     if (reduce && static_cast<int64_t>(reduce.getAxis()) == axis &&
         isXorReduce(reduce)) {
-      if (found) return triton::ReduceOp(); // Ambiguous: bail out.
+      if (found)
+        return triton::ReduceOp(); // Ambiguous: bail out.
       found = reduce;
     }
   }
@@ -1436,16 +1442,20 @@ struct BitReversalFlipToAscendFlipPattern
     for (int64_t i = 0; i < numTwos; ++i) {
       int64_t axis = flipDim + i;
       auto reduce = findReduceXorUser(cur, axis);
-      if (!reduce) return failure();
+      if (!reduce)
+        return failure();
       auto expand = getSingleUser<triton::ExpandDimsOp>(reduce->getResult(0));
       if (!expand || static_cast<int64_t>(expand.getAxis()) != axis)
         return failure();
       auto broadcast = getSingleUser<triton::BroadcastOp>(expand->getResult(0));
-      if (!broadcast) return failure();
+      if (!broadcast)
+        return failure();
       auto xori = getSingleUser<arith::XOrIOp>(broadcast->getResult(0));
-      if (!xori) return failure();
+      if (!xori)
+        return failure();
       bool lhsCur = (xori.getLhs() == cur), rhsCur = (xori.getRhs() == cur);
-      if (lhsCur == rhsCur) return failure(); // Exactly one operand == cur.
+      if (lhsCur == rhsCur)
+        return failure(); // Exactly one operand == cur.
       cur = xori->getResult(0);
       toErase.push_back(reduce);
       toErase.push_back(expand);
