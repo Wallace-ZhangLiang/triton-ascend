@@ -1437,6 +1437,8 @@ struct BitReversalFlipToAscendFlipPattern
     if (flipDim != srcTy.getRank() - 1)
       return failure();
 
+    auto srcBitcast = op.getSrc().getDefiningOp<triton::BitcastOp>();
+
     Value cur = op.getResult();
     SmallVector<Operation *> toErase{op};
     for (int64_t i = 0; i < numTwos; ++i) {
@@ -1467,11 +1469,28 @@ struct BitReversalFlipToAscendFlipPattern
     if (!finalReshape || finalReshape.getResult().getType() != srcTy)
       return failure();
 
+    auto dstBitcast =
+        getSingleUser<triton::BitcastOp>(finalReshape.getResult());
+    bool absorb = srcBitcast && dstBitcast;
+    Value flipSrc = op.getSrc();
+    RankedTensorType flipSrcTy = srcTy;
+    if (absorb) {
+      // Float path: build the flip on the original element type so its result
+      // type matches the trailing bitcast's output (which we replace directly)
+      flipSrc = srcBitcast.getSrc();
+      flipSrcTy = cast<RankedTensorType>(flipSrc.getType());
+    }
+
     rewriter.setInsertionPoint(op);
     auto flip = rewriter.create<triton::ascend::FlipOp>(
-        op.getLoc(), srcTy, op.getSrc(), static_cast<uint64_t>(flipDim));
-    // replaceOp redirects the final reshape's uses to the flip and erases it.
-    rewriter.replaceOp(finalReshape, flip.getResult());
+        op.getLoc(), flipSrcTy, flipSrc, static_cast<uint64_t>(flipDim));
+    if (absorb) {
+      rewriter.replaceOp(dstBitcast, flip.getResult());
+      toErase.push_back(finalReshape);
+      toErase.insert(toErase.begin(), srcBitcast);
+    } else {
+      rewriter.replaceOp(finalReshape, flip.getResult());
+    }
     // Erase bottom-up (consumers before producers) since erasure is immediate.
     for (auto it = toErase.rbegin(); it != toErase.rend(); ++it)
       rewriter.eraseOp(*it);
