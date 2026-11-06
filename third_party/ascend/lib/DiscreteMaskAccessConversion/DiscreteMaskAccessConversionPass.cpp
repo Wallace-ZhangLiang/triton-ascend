@@ -465,41 +465,89 @@ static MaskDecomposition decomposeAndMask(Operation *op, Value mask,
   return {contMask, discMask};
 }
 
-static bool isAxisDiscreteMask(Value mask, PatternRewriter &rewriter) {
-  if (auto andOp = mask.getDefiningOp<arith::AndIOp>()) {
-    auto isContinuousMask = [&](Value operand) {
-      MaskState mstate;
-      bool isContinuous =
-          succeeded(mstate.parse(operand, andOp.getLoc(), rewriter));
-      // Analysis can insert temporary ops even when parsing fails.
-      if (!isContinuous)
-        mstate.eraseInsertedOps(andOp, rewriter);
-      return isContinuous;
-    };
-    bool lhsIsContinuous = isContinuousMask(andOp.getLhs());
-    bool rhsIsContinuous = isContinuousMask(andOp.getRhs());
-    if (lhsIsContinuous == rhsIsContinuous)
-      return false;
-    mask = lhsIsContinuous ? andOp.getRhs() : andOp.getLhs();
+// Conservatively decide whether `expr` is constant along `axis`. At the top
+// level `expr` is the discrete mask, but the recursion also descends into its
+// integer operands (e.g. the operands of a cmpi), so it is not always a boolean
+// mask. Only shape-preserving and broadcasting producers are understood;
+// anything else is assumed to vary, which keeps the caller on the safe (SIMT)
+// side.
+static bool isInvariantAlongAxis(Value expr, int64_t axis) {
+  auto exprType = dyn_cast<RankedTensorType>(expr.getType());
+  if (!exprType)
+    return true; // scalar splat: uniform along every axis
+  if (axis < 0 || axis >= exprType.getRank())
+    return false;
+  if (exprType.getDimSize(axis) == 1)
+    return true;
+
+  Operation *producer = expr.getDefiningOp();
+  if (!producer)
+    return false; // block argument: unknown
+  if (isa<triton::SplatOp>(producer))
+    return true;
+  if (auto broadcast = dyn_cast<triton::BroadcastOp>(producer)) {
+    auto srcType = dyn_cast<RankedTensorType>(broadcast.getSrc().getType());
+    if (!srcType)
+      return true;
+    int64_t leading = exprType.getRank() - srcType.getRank();
+    if (axis < leading)
+      return true; // dimension created by the broadcast itself
+    return isInvariantAlongAxis(broadcast.getSrc(), axis - leading);
   }
-  return isa_and_nonnull<triton::BroadcastOp>(mask.getDefiningOp());
+  if (auto expand = dyn_cast<triton::ExpandDimsOp>(producer)) {
+    int64_t inserted = static_cast<int64_t>(expand.getAxis());
+    if (axis == inserted)
+      return true;
+    return isInvariantAlongAxis(expand.getSrc(), axis > inserted ? axis - 1
+                                                                 : axis);
+  }
+  if (auto select = dyn_cast<arith::SelectOp>(producer))
+    return isInvariantAlongAxis(select.getCondition(), axis) &&
+           isInvariantAlongAxis(select.getTrueValue(), axis) &&
+           isInvariantAlongAxis(select.getFalseValue(), axis);
+  if (auto andOp = dyn_cast<arith::AndIOp>(producer))
+    return isInvariantAlongAxis(andOp.getLhs(), axis) &&
+           isInvariantAlongAxis(andOp.getRhs(), axis);
+  if (auto orOp = dyn_cast<arith::OrIOp>(producer))
+    return isInvariantAlongAxis(orOp.getLhs(), axis) &&
+           isInvariantAlongAxis(orOp.getRhs(), axis);
+  if (auto cmp = dyn_cast<arith::CmpIOp>(producer))
+    return isInvariantAlongAxis(cmp.getLhs(), axis) &&
+           isInvariantAlongAxis(cmp.getRhs(), axis);
+  if (auto ext = dyn_cast<arith::ExtSIOp>(producer))
+    return isInvariantAlongAxis(ext.getIn(), axis);
+  return false;
 }
 
-static bool isAxisDiscreteMaskLoad(triton::LoadOp op,
-                                   PatternRewriter &rewriter) {
+// Routing predicate for the SIMD carve-out. It is built on the same
+// decomposition the rewrite below uses, so the two cannot disagree: the mask
+// must carry a discrete component, and that component must be constant along at
+// least one axis. Aligning the mask against the pointer's stride-1 axis is
+// deliberately left out of this step: it needs the pointer analysis and a
+// measured baseline before it can move the routing boundary.
+static bool isAxisDiscreteMask(triton::LoadOp op,
+                               PatternRewriter &rewriter) {
   auto ptrType = dyn_cast<RankedTensorType>(op.getPtr().getType());
   auto maskType = dyn_cast<RankedTensorType>(op.getMask().getType());
+  if (!ptrType || !maskType || ptrType.getRank() < 1)
+    return false;
+  // Static shapes only: the axis loop below needs a known extent, and the
+  // rewrite needs ptr and mask to describe the same tile.
+  if (llvm::any_of(ptrType.getShape(),
+                   [](int64_t size) { return size <= 0; }))
+    return false;
+  if (maskType.getShape() != ptrType.getShape())
+    return false;
 
-  // FIXME: Only 2D pointers and masks are currently supported. The
-  // axis-discrete mask optimization needs generalizing to other ranks.
-  if (!ptrType || !maskType || ptrType.getRank() != 2)
+  MaskDecomposition decomposition =
+      decomposeAndMask(op, op.getMask(), op.getLoc(), rewriter);
+  if (!decomposition.discMask)
     return false;
-  auto shape = ptrType.getShape();
-  if (shape[0] <= 0 || shape[1] <= 0)
-    return false;
-  if (maskType.getShape() != shape)
-    return false;
-  return isAxisDiscreteMask(op.getMask(), rewriter);
+
+  for (int64_t axis = 0; axis < maskType.getRank(); ++axis)
+    if (isInvariantAlongAxis(decomposition.discMask, axis))
+      return true;
+  return false;
 }
 
 struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
@@ -612,7 +660,7 @@ struct DiscreteMaskLoadConversion : OpRewritePattern<triton::LoadOp> {
     if (compileOn91095Flag &&
         triton::ascend::isSimtTemplateMode(compileModeFlag) &&
         rankWithinIndirectFastPathLimit &&
-        !isAxisDiscreteMaskLoad(op, rewriter)) {
+        !isAxisDiscreteMask(op, rewriter)) {
       op->setAttr(ConverterUtils::mixCompileDiscreteMaskAttrName,
                   rewriter.getUnitAttr());
       return failure();

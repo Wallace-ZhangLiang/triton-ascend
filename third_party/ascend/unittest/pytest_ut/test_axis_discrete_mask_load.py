@@ -126,6 +126,57 @@ def test_axis_discrete_mask_load(G, BLOCK_K):
 
 
 @triton.jit
+def _axis_discrete_mask_load_kernel_2d_and(
+    kv_ptr,
+    out_ptr,
+    limit,  # runtime scalar column bound
+    BLOCK_K: tl.constexpr,
+    G: tl.constexpr,
+):
+    k_offs = tl.arange(0, BLOCK_K)
+    g = tl.arange(0, G)
+
+    # Top-level 2D AND: discrete rows & continuous columns.
+    row_keep = (k_offs % 2) == 0
+    col_keep = g < limit
+    mask = row_keep[:, None] & col_keep[None, :]
+
+    kv0 = tl.load(
+        kv_ptr + k_offs[:, None] * G + g[None, :],
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(out_ptr + k_offs[:, None] * G + g[None, :], kv0)
+
+
+@pytest.mark.parametrize("G,BLOCK_K,limit", [
+    (128, 64, 96),
+    (64, 128, 32),
+])
+def test_axis_discrete_mask_load_2d_and(G, BLOCK_K, limit):
+    torch.manual_seed(0)
+    kv = torch.randn(BLOCK_K, G, dtype=torch.float16, device="npu")
+    out = torch.zeros((BLOCK_K, G), dtype=torch.float16, device="npu")
+
+    def _reference():
+        ref = kv.clone()
+        ref[1::2, :] = 0  # discrete rows
+        ref[:, limit:] = 0  # continuous columns
+        return ref
+
+    _axis_discrete_mask_load_kernel_2d_and[(1, )](
+        kv,
+        out,
+        limit,
+        BLOCK_K=BLOCK_K,
+        G=G,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(out, _reference(), rtol=0, atol=0)
+
+
+@triton.jit
 def _axis_continuous_mask_load_kernel(
     kv_ptr,
     idx_ptr,
