@@ -135,6 +135,66 @@ def test_axis_discrete_mask_load_2d_and(G, BLOCK_K, limit):
 
 
 @triton.jit
+def _axis_discrete_mask_load_kernel_rank3(
+    kv_ptr,
+    idx_ptr,
+    out_ptr,
+    topk,  # runtime scalar bound along the discrete axis
+    BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    G: tl.constexpr,
+):
+    r = tl.arange(0, BLOCK_R)
+    k_offs = tl.arange(0, BLOCK_K)
+    g = tl.arange(0, G)
+
+    # Axis-discrete rank-3 load: ptr structured, mask constant along both
+    # the leading dim (BLOCK_R) and the contiguous dim (G).
+    in_range = k_offs < topk
+    slot = tl.load(idx_ptr + k_offs, mask=in_range, other=0)
+    valid = in_range & (slot >= 0)
+
+    offs = (r[:, None, None] * (BLOCK_K * G) + k_offs[None, :, None] * G +
+            g[None, None, :])
+    kv0 = tl.load(
+        kv_ptr + offs,
+        mask=valid[None, :, None],
+        other=0.0,
+    )
+    tl.store(out_ptr + offs, kv0)
+
+
+@pytest.mark.parametrize("BLOCK_R,BLOCK_K,G,topk", [
+    (8, 64, 128, 48),
+    (4, 128, 64, 96),
+])
+def test_axis_discrete_mask_load_rank3(BLOCK_R, BLOCK_K, G, topk):
+    torch.manual_seed(0)
+    kv = torch.randn(BLOCK_R, BLOCK_K, G, dtype=torch.float16, device="npu")
+    idx = torch.randint(0, BLOCK_K, (BLOCK_K, ), dtype=torch.int32, device="npu")
+    idx[idx % 2 == 1] = -1  # force odd rows to be masked out
+    out = torch.zeros((BLOCK_R, BLOCK_K, G), dtype=torch.float16, device="npu")
+
+    def _reference():
+        rows = (torch.arange(BLOCK_K) < topk) & (idx.cpu() >= 0)
+        keep = rows.to(kv.dtype).view(1, BLOCK_K, 1).to(kv.device)
+        return kv * keep
+
+    _axis_discrete_mask_load_kernel_rank3[(1, )](
+        kv,
+        idx,
+        out,
+        topk,
+        BLOCK_R=BLOCK_R,
+        BLOCK_K=BLOCK_K,
+        G=G,
+    )
+    torch.npu.synchronize()
+
+    torch.testing.assert_close(out, _reference(), rtol=0, atol=0)
+
+
+@triton.jit
 def _axis_continuous_mask_load_kernel(
     kv_ptr,
     idx_ptr,
