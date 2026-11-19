@@ -474,6 +474,35 @@ static bool isAxisDiscreteMaskLoad(triton::LoadOp op,
   return false;
 }
 
+// Store counterpart of isAxisDiscreteMaskLoad. Stores may read their pointer
+// and mask from different producers, so both are checked, and the value must
+// describe the same tile (the read-modify-write select needs matching shapes).
+static bool isAxisDiscreteMaskStore(triton::StoreOp op,
+                                    PatternRewriter &rewriter) {
+  auto ptrType = dyn_cast<RankedTensorType>(op.getPtr().getType());
+  auto maskType = dyn_cast<RankedTensorType>(op.getMask().getType());
+  auto valType = dyn_cast<RankedTensorType>(op.getValue().getType());
+  if (!ptrType || !maskType || !valType || ptrType.getRank() < 1)
+    return false;
+  // Keep singleton axes on the general masked-store path (same rule as loads).
+  if (llvm::any_of(ptrType.getShape(),
+                   [](int64_t size) { return size <= 1; }))
+    return false;
+  if (maskType.getShape() != ptrType.getShape() ||
+      valType.getShape() != ptrType.getShape())
+    return false;
+
+  auto [contMask, discMask] =
+      decomposeAndMask(op, op.getMask(), op.getLoc(), rewriter);
+  if (!discMask)
+    return false;
+
+  for (int64_t axis = 0; axis < maskType.getRank(); ++axis)
+    if (isInvariantAlongAxis(discMask, axis))
+      return true;
+  return false;
+}
+
 struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
   using OpRewritePattern<triton::StoreOp>::OpRewritePattern;
 
@@ -496,7 +525,8 @@ struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
         ptrType && ptrType.getShape().size() <= 5;
     if (compileOn91095Flag &&
         triton::ascend::isSimtTemplateMode(compileModeFlag) &&
-        rankWithinIndirectFastPathLimit) {
+        rankWithinIndirectFastPathLimit &&
+        !isAxisDiscreteMaskStore(op, rewriter)) {
       op->setAttr(ConverterUtils::mixCompileDiscreteMaskAttrName,
                   rewriter.getUnitAttr());
       return failure();
