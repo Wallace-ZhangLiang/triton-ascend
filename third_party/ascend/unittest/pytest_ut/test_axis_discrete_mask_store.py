@@ -158,3 +158,53 @@ def test_axis_c1_mask_store_falls_back_to_simt(G, BLOCK_K):
     adapter = _adapter(compiled, "axis_c1_mask_store")
     assert "indirect_store" in adapter, (
         "per-row variable-length mask unexpectedly avoided the SIMT fallback")
+
+
+@triton.jit
+def _multi_program_axis_discrete_store_kernel(
+    out_ptr,
+    BLOCK_K: tl.constexpr,
+    G: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    k = tl.arange(0, BLOCK_K)
+    g = tl.arange(0, G)
+
+    # Two programs write disjoint rows of the same tile.  Each store is a
+    # full-tile read-modify-write, so without the block lock the later writer
+    # can put back stale values for the other program's rows.
+    keep = (k % 2) == pid
+    val = tl.full([BLOCK_K, G], 0.0, tl.float16) + (pid + 1).to(tl.float16)
+    tl.store(out_ptr + k[:, None] * G + g[None, :], val, mask=keep[:, None])
+
+
+@pytest.mark.parametrize("G,BLOCK_K", [
+    (128, 64),
+    (64, 32),
+])
+def test_multi_program_store_falls_back_to_simt(G, BLOCK_K):
+    """Overlapping read-modify-write windows must use the SIMT per-lane store.
+
+    With sync_block_lock the two full-tile passes serialize and measure ~2x the
+    SIMT fallback, so the carve-out is deliberately disabled for this case.
+    """
+    _skip_unless_register_based()
+
+    for _ in range(5):
+        out = torch.zeros((BLOCK_K, G), dtype=torch.float16, device="npu")
+        compiled = _multi_program_axis_discrete_store_kernel[(2, )](
+            out, BLOCK_K=BLOCK_K, G=G)
+        torch.npu.synchronize()
+
+        k = torch.arange(BLOCK_K, device="npu")[:, None]
+        expected = torch.where((k % 2) == 0,
+                               torch.full_like(out, 1.0),
+                               torch.full_like(out, 2.0))
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    adapter = _adapter(compiled, "multi_program_axis_discrete_store")
+    assert "indirect_store" in adapter, (
+        "overlapping stores should stay on the SIMT per-lane store path")
+    assert "sync_block_lock" not in adapter, (
+        "overlapping stores should not take the lock-serialized read-modify-write")
+

@@ -523,10 +523,14 @@ struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
     auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
     bool rankWithinIndirectFastPathLimit =
         ptrType && ptrType.getShape().size() <= 5;
+    // The read-modify-write window only pays off when no cross-program lock is
+    // needed.  When sync_block_lock would serialize two full-tile passes the
+    // measured cost is ~2x the SIMT fallback on A5, so overlapping programs
+    // stay on the indirect store path.
     if (compileOn91095Flag &&
         triton::ascend::isSimtTemplateMode(compileModeFlag) &&
         rankWithinIndirectFastPathLimit &&
-        !isAxisDiscreteMaskStore(op, rewriter)) {
+        (useSyncBlockLockFlag || !isAxisDiscreteMaskStore(op, rewriter))) {
       op->setAttr(ConverterUtils::mixCompileDiscreteMaskAttrName,
                   rewriter.getUnitAttr());
       return failure();
