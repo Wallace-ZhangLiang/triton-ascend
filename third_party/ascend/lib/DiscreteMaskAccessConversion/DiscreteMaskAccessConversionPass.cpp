@@ -421,8 +421,8 @@ static bool isInvariantAlongAxis(Value expr, int64_t axis) {
     int64_t inserted = static_cast<int64_t>(expand.getAxis());
     if (axis == inserted)
       return true;
-    return isInvariantAlongAxis(expand.getSrc(), axis > inserted ? axis - 1
-                                                                 : axis);
+    return isInvariantAlongAxis(expand.getSrc(),
+                                axis > inserted ? axis - 1 : axis);
   }
   if (auto select = dyn_cast<arith::SelectOp>(producer))
     return isInvariantAlongAxis(select.getCondition(), axis) &&
@@ -457,8 +457,7 @@ static bool isAxisDiscreteMaskLoad(triton::LoadOp op,
   // Static shapes only: the axis loop below needs a known extent, and the
   // rewrite needs ptr and mask to describe the same tile.
   // Keep singleton axes on the general masked-load path.
-  if (llvm::any_of(ptrType.getShape(),
-                   [](int64_t size) { return size <= 1; }))
+  if (llvm::any_of(ptrType.getShape(), [](int64_t size) { return size <= 1; }))
     return false;
   if (maskType.getShape() != ptrType.getShape())
     return false;
@@ -485,8 +484,7 @@ static bool isAxisDiscreteMaskStore(triton::StoreOp op,
   if (!ptrType || !maskType || !valType || ptrType.getRank() < 1)
     return false;
   // Keep singleton axes on the general masked-store path (same rule as loads).
-  if (llvm::any_of(ptrType.getShape(),
-                   [](int64_t size) { return size <= 1; }))
+  if (llvm::any_of(ptrType.getShape(), [](int64_t size) { return size <= 1; }))
     return false;
   if (maskType.getShape() != ptrType.getShape() ||
       valType.getShape() != ptrType.getShape())

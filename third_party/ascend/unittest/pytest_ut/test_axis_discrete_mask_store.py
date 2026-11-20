@@ -29,8 +29,7 @@ def _adapter(compiled, kernel_name):
 def _assert_simd_store_routing(compiled, kernel_name):
     """The store must stay on the vectorized read-modify-write path."""
     adapter = _adapter(compiled, kernel_name)
-    assert "indirect_store" not in adapter, (
-        f"{kernel_name}: masked store fell back to the SIMT template path")
+    assert "indirect_store" not in adapter, (f"{kernel_name}: masked store fell back to the SIMT template path")
     assert "indirect_load" not in adapter, (
         f"{kernel_name}: read-modify-write load fell back to the SIMT template path")
     assert "arith.select" in adapter, "masked lanes were not folded into arith.select"
@@ -87,8 +86,7 @@ def _axis_c1_mask_store_kernel(
 
 
 def _init_out(BLOCK_K, G):
-    return (torch.arange(BLOCK_K * G, dtype=torch.float16, device="npu") % 101).reshape(
-        BLOCK_K, G)
+    return (torch.arange(BLOCK_K * G, dtype=torch.float16, device="npu") % 101).reshape(BLOCK_K, G)
 
 
 @pytest.mark.parametrize("G,BLOCK_K", [
@@ -120,8 +118,7 @@ def test_axis_discrete_mask_store_and(G, BLOCK_K, limit):
     out = _init_out(BLOCK_K, G)
     original = out.clone()
 
-    compiled = _axis_discrete_mask_store_and_kernel[(1, )](
-        out, limit, BLOCK_K=BLOCK_K, G=G)
+    compiled = _axis_discrete_mask_store_and_kernel[(1, )](out, limit, BLOCK_K=BLOCK_K, G=G)
     torch.npu.synchronize()
 
     k = torch.arange(BLOCK_K, device="npu")[:, None]
@@ -146,8 +143,7 @@ def test_axis_c1_mask_store_falls_back_to_simt(G, BLOCK_K):
     original = out.clone()
     bounds = torch.randint(0, G + 1, (BLOCK_K, ), dtype=torch.int32, device="npu")
 
-    compiled = _axis_c1_mask_store_kernel[(1, )](
-        out, bounds, BLOCK_K=BLOCK_K, G=G)
+    compiled = _axis_c1_mask_store_kernel[(1, )](out, bounds, BLOCK_K=BLOCK_K, G=G)
     torch.npu.synchronize()
 
     g = torch.arange(G, device="npu")[None, :]
@@ -156,8 +152,7 @@ def test_axis_c1_mask_store_falls_back_to_simt(G, BLOCK_K):
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     adapter = _adapter(compiled, "axis_c1_mask_store")
-    assert "indirect_store" in adapter, (
-        "per-row variable-length mask unexpectedly avoided the SIMT fallback")
+    assert "indirect_store" in adapter, ("per-row variable-length mask unexpectedly avoided the SIMT fallback")
 
 
 @triton.jit
@@ -192,19 +187,14 @@ def test_multi_program_store_falls_back_to_simt(G, BLOCK_K):
 
     for _ in range(5):
         out = torch.zeros((BLOCK_K, G), dtype=torch.float16, device="npu")
-        compiled = _multi_program_axis_discrete_store_kernel[(2, )](
-            out, BLOCK_K=BLOCK_K, G=G)
+        compiled = _multi_program_axis_discrete_store_kernel[(2, )](out, BLOCK_K=BLOCK_K, G=G)
         torch.npu.synchronize()
 
         k = torch.arange(BLOCK_K, device="npu")[:, None]
-        expected = torch.where((k % 2) == 0,
-                               torch.full_like(out, 1.0),
-                               torch.full_like(out, 2.0))
+        expected = torch.where((k % 2) == 0, torch.full_like(out, 1.0), torch.full_like(out, 2.0))
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     adapter = _adapter(compiled, "multi_program_axis_discrete_store")
-    assert "indirect_store" in adapter, (
-        "overlapping stores should stay on the SIMT per-lane store path")
+    assert "indirect_store" in adapter, ("overlapping stores should stay on the SIMT per-lane store path")
     assert "sync_block_lock" not in adapter, (
         "overlapping stores should not take the lock-serialized read-modify-write")
-

@@ -59,7 +59,6 @@ def _assert_simd_routing(compiled, kernel_name):
     return adapter
 
 
-
 @triton.jit
 def _axis_discrete_mask_load_kernel(
     kv_ptr,
@@ -188,8 +187,7 @@ def _axis_discrete_mask_load_kernel_rank3(
     slot = tl.load(idx_ptr + k_offs, mask=in_range, other=0)
     valid = in_range & (slot >= 0)
 
-    offs = (r[:, None, None] * (BLOCK_K * G) + k_offs[None, :, None] * G +
-            g[None, None, :])
+    offs = (r[:, None, None] * (BLOCK_K * G) + k_offs[None, :, None] * G + g[None, None, :])
     kv0 = tl.load(
         kv_ptr + offs,
         mask=valid[None, :, None],
@@ -547,4 +545,3 @@ def test_axis_select_mask_load_routing(G, BLOCK_K):
 
     adapter = _assert_simd_routing(compiled, "axis_select_mask_load")
     assert "arith.select" in adapter
-
