@@ -24,6 +24,7 @@
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
 
 #include "TritonControlFlowOpt/ControlFlowRewrite.h"
+#include "TritonMemoryAccess/LoadStoreMaskAnalysis.h"
 #include "ascend/include/TritonToLinalg/LoadStoreConverter.h"
 #include "ascend/include/TritonToLinalg/MaskAnalysis.h"
 #include "ascend/include/TritonToStructured/MemOpConverter.h"
@@ -38,6 +39,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/LogicalResult.h"
 
@@ -388,82 +390,36 @@ LogicalResult isDiscreteMask(Operation *op, Value mask,
   return success();
 }
 
-// Conservatively decide whether `expr` is constant along `axis`. At the top
-// level `expr` is the discrete mask, but the recursion also descends into its
-// integer operands (e.g. the operands of a cmpi), so it is not always a boolean
-// mask. Only shape-preserving and broadcasting producers are understood;
-// anything else is assumed to vary, which keeps the caller on the safe (SIMT)
-// side.
-static bool isInvariantAlongAxis(Value expr, int64_t axis) {
-  auto exprType = dyn_cast<RankedTensorType>(expr.getType());
-  if (!exprType)
-    return true; // scalar splat: uniform along every axis
-  if (axis < 0 || axis >= exprType.getRank())
-    return false;
-  if (exprType.getDimSize(axis) == 1)
-    return true;
-
-  Operation *producer = expr.getDefiningOp();
-  if (!producer)
-    return false; // block argument: unknown
-  if (isa<triton::SplatOp>(producer))
-    return true;
-  if (auto broadcast = dyn_cast<triton::BroadcastOp>(producer)) {
-    auto srcType = dyn_cast<RankedTensorType>(broadcast.getSrc().getType());
-    if (!srcType)
-      return true;
-    int64_t leading = exprType.getRank() - srcType.getRank();
-    if (axis < leading)
-      return true; // dimension created by the broadcast itself
-    return isInvariantAlongAxis(broadcast.getSrc(), axis - leading);
-  }
-  if (auto expand = dyn_cast<triton::ExpandDimsOp>(producer)) {
-    int64_t inserted = static_cast<int64_t>(expand.getAxis());
-    if (axis == inserted)
-      return true;
-    return isInvariantAlongAxis(expand.getSrc(),
-                                axis > inserted ? axis - 1 : axis);
-  }
-  if (auto select = dyn_cast<arith::SelectOp>(producer))
-    return isInvariantAlongAxis(select.getCondition(), axis) &&
-           isInvariantAlongAxis(select.getTrueValue(), axis) &&
-           isInvariantAlongAxis(select.getFalseValue(), axis);
-  if (auto andOp = dyn_cast<arith::AndIOp>(producer))
-    return isInvariantAlongAxis(andOp.getLhs(), axis) &&
-           isInvariantAlongAxis(andOp.getRhs(), axis);
-  if (auto orOp = dyn_cast<arith::OrIOp>(producer))
-    return isInvariantAlongAxis(orOp.getLhs(), axis) &&
-           isInvariantAlongAxis(orOp.getRhs(), axis);
-  if (auto cmp = dyn_cast<arith::CmpIOp>(producer))
-    return isInvariantAlongAxis(cmp.getLhs(), axis) &&
-           isInvariantAlongAxis(cmp.getRhs(), axis);
-  if (auto ext = dyn_cast<arith::ExtSIOp>(producer))
-    return isInvariantAlongAxis(ext.getIn(), axis);
-  return false;
-}
-
 // Routing predicate for the SIMD carve-out. It is built on the same
 // decomposition the rewrite below uses, so the two cannot disagree: the mask
 // must carry a discrete component, and that component must be constant along at
 // least one axis. Aligning the mask against the pointer's stride-1 axis is
 // deliberately left out of this step: it needs the pointer analysis and a
 // measured baseline before it can move the routing boundary.
-static bool isAxisDiscreteMaskLoad(triton::LoadOp op,
-                                   PatternRewriter &rewriter) {
-  auto ptrType = dyn_cast<RankedTensorType>(op.getPtr().getType());
-  auto maskType = dyn_cast<RankedTensorType>(op.getMask().getType());
+//
+// `sameShapeValues` are the remaining operands that must describe the same tile
+// (stores pass the value, because the read-modify-write select needs matching
+// shapes).
+static bool isAxisDiscreteAccess(Operation *op, Value ptr, Value mask,
+                                 ArrayRef<Value> sameShapeValues,
+                                 PatternRewriter &rewriter) {
+  auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
+  auto maskType = dyn_cast<RankedTensorType>(mask.getType());
   if (!ptrType || !maskType || ptrType.getRank() < 1)
     return false;
-  // Static shapes only: the axis loop below needs a known extent, and the
-  // rewrite needs ptr and mask to describe the same tile.
-  // Keep singleton axes on the general masked-load path.
+  // Keep singleton axes on the general masked-access path.
   if (llvm::any_of(ptrType.getShape(), [](int64_t size) { return size <= 1; }))
     return false;
   if (maskType.getShape() != ptrType.getShape())
     return false;
+  for (Value value : sameShapeValues) {
+    auto type = dyn_cast<RankedTensorType>(value.getType());
+    if (!type || type.getShape() != ptrType.getShape())
+      return false;
+  }
 
   auto [contMask, discMask] =
-      decomposeAndMask(op, op.getMask(), op.getLoc(), rewriter);
+      decomposeAndMask(op, mask, op->getLoc(), rewriter);
   if (!discMask)
     return false;
 
@@ -473,32 +429,15 @@ static bool isAxisDiscreteMaskLoad(triton::LoadOp op,
   return false;
 }
 
-// Store counterpart of isAxisDiscreteMaskLoad. Stores may read their pointer
-// and mask from different producers, so both are checked, and the value must
-// describe the same tile (the read-modify-write select needs matching shapes).
+static bool isAxisDiscreteMaskLoad(triton::LoadOp op,
+                                   PatternRewriter &rewriter) {
+  return isAxisDiscreteAccess(op, op.getPtr(), op.getMask(), {}, rewriter);
+}
+
 static bool isAxisDiscreteMaskStore(triton::StoreOp op,
                                     PatternRewriter &rewriter) {
-  auto ptrType = dyn_cast<RankedTensorType>(op.getPtr().getType());
-  auto maskType = dyn_cast<RankedTensorType>(op.getMask().getType());
-  auto valType = dyn_cast<RankedTensorType>(op.getValue().getType());
-  if (!ptrType || !maskType || !valType || ptrType.getRank() < 1)
-    return false;
-  // Keep singleton axes on the general masked-store path (same rule as loads).
-  if (llvm::any_of(ptrType.getShape(), [](int64_t size) { return size <= 1; }))
-    return false;
-  if (maskType.getShape() != ptrType.getShape() ||
-      valType.getShape() != ptrType.getShape())
-    return false;
-
-  auto [contMask, discMask] =
-      decomposeAndMask(op, op.getMask(), op.getLoc(), rewriter);
-  if (!discMask)
-    return false;
-
-  for (int64_t axis = 0; axis < maskType.getRank(); ++axis)
-    if (isInvariantAlongAxis(discMask, axis))
-      return true;
-  return false;
+  return isAxisDiscreteAccess(op, op.getPtr(), op.getMask(),
+                              {op.getValue()}, rewriter);
 }
 
 struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
@@ -521,10 +460,8 @@ struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
     auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
     bool rankWithinIndirectFastPathLimit =
         ptrType && ptrType.getShape().size() <= 5;
-    // The read-modify-write window only pays off when no cross-program lock is
-    // needed.  When sync_block_lock would serialize two full-tile passes the
-    // measured cost is ~2x the SIMT fallback on A5, so overlapping programs
-    // stay on the indirect store path.
+    // RMW is ~2.3x faster than SIMT without a lock, but ~2x slower with
+    // sync_block_lock; overlapping programs stay on the indirect store path.
     if (compileOn91095Flag &&
         triton::ascend::isSimtTemplateMode(compileModeFlag) &&
         rankWithinIndirectFastPathLimit &&

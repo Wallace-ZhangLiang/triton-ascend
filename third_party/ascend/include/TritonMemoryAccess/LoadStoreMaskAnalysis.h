@@ -242,6 +242,12 @@ MaskDecomposition decomposeAndMask(Operation *op, Value mask,
                                    const Location &loc,
                                    PatternRewriter &rewriter);
 
+// Conservatively decide whether `expr` is constant along `axis`. `expr` may be
+// a boolean mask or one of its integer operands (e.g. the operands of a cmpi).
+// Only shape-preserving and broadcasting producers are understood; anything
+// else is reported as varying so callers stay on the safe (SIMT) side.
+bool isInvariantAlongAxis(Value expr, int64_t axis);
+
 std::optional<MaskState> runMaskAnalysis(Operation *op, OpBuilder &builder);
 
 } // namespace triton

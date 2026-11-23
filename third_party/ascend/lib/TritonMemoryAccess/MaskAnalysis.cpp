@@ -1099,6 +1099,60 @@ MaskDecomposition decomposeAndMask(Operation *op, Value mask,
   return {contMask, discMask};
 }
 
+// Conservatively decide whether `expr` is constant along `axis`. At the top
+// level `expr` is the discrete mask, but the recursion also descends into its
+// integer operands (e.g. the operands of a cmpi), so it is not always a boolean
+// mask. Only shape-preserving and broadcasting producers are understood;
+// anything else is assumed to vary, which keeps the caller on the safe (SIMT)
+// side.
+bool isInvariantAlongAxis(Value expr, int64_t axis) {
+  auto exprType = dyn_cast<RankedTensorType>(expr.getType());
+  if (!exprType)
+    return true; // scalar splat: uniform along every axis
+  if (axis < 0 || axis >= exprType.getRank())
+    return false;
+  if (exprType.getDimSize(axis) == 1)
+    return true;
+
+  Operation *producer = expr.getDefiningOp();
+  if (!producer)
+    return false; // block argument: unknown
+  if (isa<triton::SplatOp>(producer))
+    return true;
+  if (auto broadcast = dyn_cast<triton::BroadcastOp>(producer)) {
+    auto srcType = dyn_cast<RankedTensorType>(broadcast.getSrc().getType());
+    if (!srcType)
+      return true;
+    int64_t leading = exprType.getRank() - srcType.getRank();
+    if (axis < leading)
+      return true; // dimension created by the broadcast itself
+    return isInvariantAlongAxis(broadcast.getSrc(), axis - leading);
+  }
+  if (auto expand = dyn_cast<triton::ExpandDimsOp>(producer)) {
+    int64_t inserted = static_cast<int64_t>(expand.getAxis());
+    if (axis == inserted)
+      return true;
+    return isInvariantAlongAxis(expand.getSrc(),
+                                axis > inserted ? axis - 1 : axis);
+  }
+  if (auto select = dyn_cast<arith::SelectOp>(producer))
+    return isInvariantAlongAxis(select.getCondition(), axis) &&
+           isInvariantAlongAxis(select.getTrueValue(), axis) &&
+           isInvariantAlongAxis(select.getFalseValue(), axis);
+  if (auto andOp = dyn_cast<arith::AndIOp>(producer))
+    return isInvariantAlongAxis(andOp.getLhs(), axis) &&
+           isInvariantAlongAxis(andOp.getRhs(), axis);
+  if (auto orOp = dyn_cast<arith::OrIOp>(producer))
+    return isInvariantAlongAxis(orOp.getLhs(), axis) &&
+           isInvariantAlongAxis(orOp.getRhs(), axis);
+  if (auto cmp = dyn_cast<arith::CmpIOp>(producer))
+    return isInvariantAlongAxis(cmp.getLhs(), axis) &&
+           isInvariantAlongAxis(cmp.getRhs(), axis);
+  if (auto ext = dyn_cast<arith::ExtSIOp>(producer))
+    return isInvariantAlongAxis(ext.getIn(), axis);
+  return false;
+}
+
 std::optional<MaskState> runMaskAnalysis(Operation *op, OpBuilder &builder) {
   if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
     return runMaskAnalysisImpl(loadOp, builder);
